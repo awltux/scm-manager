@@ -72,24 +72,27 @@ public class LocalDatabaseSynchronizer {
    * @param groups groups of authenticated user
    */
   public void synchronize(User user, Set<String> groups) {
-    adminSelector.checkForAuthenticatedAdmin(user, groups);
+    boolean adminFlagCameFromSSP = adminSelector.checkForAuthenticatedAdmin(user, groups);
 
     User dbUser = userDAO.get(user.getId());
     if (dbUser != null) {
-      synchronizeWithLocalDatabase(user, dbUser);
+      synchronizeWithLocalDatabase(user, dbUser, adminFlagCameFromSSP);
     } else if (user.isValid()) {
       createUserInLocalDatabase(user);
     } else {
-      logger.warn("could not create user {}, beacause it is not valid", user.getName());
+      logger.warn("could not create user {}, because it is not valid", user.getName());
     }
   }
   
-  private void synchronizeWithLocalDatabase(User user, User dbUser) {
-    synchronizeAdminFlag(user, dbUser);
+  private void synchronizeWithLocalDatabase(User user, User dbUser, boolean adminFlagCameFromSSP) {
+    // Let CMRE SSP take precedence over DB
+    if ( ! adminFlagCameFromSSP ) {
+      synchronizeAdminFlag(user, dbUser);
+    }
     synchronizeActiveFlag(user, dbUser);
     modifyUserInLocalDatabase(user, dbUser);
   }
-  
+
   private void synchronizeAdminFlag(User user, User dbUser) {
     // if database user is an admin, set admin for the current user
     if (dbUser.isAdmin()) {

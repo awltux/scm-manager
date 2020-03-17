@@ -31,13 +31,24 @@
 package sonia.scm.security;
 
 import com.google.inject.Inject;
+
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.io.InputStream;
 import java.util.Collection;
+import java.util.Properties;
 import java.util.Set;
+import java.net.URL;
+
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import sonia.scm.config.ScmConfiguration;
 import sonia.scm.user.User;
 import sonia.scm.util.Util;
+import com.sun.jersey.api.client.Client;
+import com.sun.jersey.api.client.ClientResponse;
+import com.sun.jersey.api.client.WebResource;
+
 
 /**
  * Detects administrator from configuration.
@@ -46,13 +57,32 @@ import sonia.scm.util.Util;
  * @since 1.52
  */
 public class AdminDetector {
-  
+
+  private static final String scmPropertiesfilename = "/scm.properties";
+  private static final Properties scmProperties;
+
   /**
    * the logger for AdminDetector
    */
   private static final Logger LOG = LoggerFactory.getLogger(AdminDetector.class);
-  
+
   private final ScmConfiguration configuration;
+
+ static{
+    InputStream is = null;
+    scmProperties = new Properties();
+    try {
+      is = AdminDetector.class.getResourceAsStream(scmPropertiesfilename);
+      scmProperties.load(is);
+    }
+    catch (FileNotFoundException e) {
+      e.printStackTrace();
+    }
+    catch (IOException e) {
+      e.printStackTrace();
+    }
+  }
+
 
   /**
    * Constructs admin detector.
@@ -70,17 +100,71 @@ public class AdminDetector {
    * @param user authenticated user
    * @param groups groups of authenticated user
    */
-  public void checkForAuthenticatedAdmin(User user, Set<String> groups) {
-    if (!user.isAdmin()) {
-      user.setAdmin(isAdminByConfiguration(user, groups));
-
-      if (LOG.isDebugEnabled() && user.isAdmin()) {
-        LOG.debug("user {} is marked as admin by configuration", user.getName());
+  public boolean checkForAuthenticatedAdmin(User user, Set<String> groups) {
+    boolean adminFlagCameFromSSP = false;
+    boolean isCurrentlyAdmin = user.isAdmin();
+    // Default to no change
+    boolean isAdmin = isCurrentlyAdmin;
+    try {
+      // Check SSP first, but only for ldap/activedirectory users
+      if ( user.getType() == "ldap" || user.getType() == "activedirectory" ) {
+        isAdmin = isAdminBySelfService(user);
+        adminFlagCameFromSSP = true;
+        if (isCurrentlyAdmin != isAdmin) {
+          if (LOG.isDebugEnabled()) {
+            LOG.debug("CMRE SSP admin state changed for user {}. isAdmin={}", user.getName(), isAdmin);
+          }
+        } else {
+          if (LOG.isDebugEnabled()) {
+            LOG.debug("CMRE SSP admin state already synced with user {}. isAdmin={}", user.getName(), isAdmin);
+          }
+        }
+      } else {
+        throw new Exception("Only checks ldap users: type=" + user.getType() );
+      }
+    } catch(Exception e) {
+      if (LOG.isDebugEnabled()) {
+        LOG.debug("CMRE SSP admin check skipped: {}", e.toString());
+      }
+      if (!isCurrentlyAdmin) {
+        // If SSP fails, fallback on SCM config
+        isAdmin = isAdminByConfiguration(user, groups);
+        if ( isAdmin ) {
+          if (LOG.isDebugEnabled()) {
+            LOG.debug("user {} is marked as admin by configuration", user.getName());
+          }
+        }
+      }
+      else if (LOG.isDebugEnabled()) {
+        LOG.debug("authenticator {} marked user {} as admin", user.getType(), user.getName());
       }
     }
-    else if (LOG.isDebugEnabled()) {
-      LOG.debug("authenticator {} marked user {} as admin", user.getType(), user.getName());
-    }
+    user.setAdmin(isAdmin);
+    return adminFlagCameFromSSP;
+  }
+  
+  
+  private boolean isAdminBySelfService(User user) throws Exception {
+    URL url = new URL(configuration.getBaseUrl());
+    // Path is of the form "/scm"
+    String projectId = url.getPath().split("/")[1];
+    String sspUrl = scmProperties.getProperty("cmre.scm.url");
+    String input = "{\"userId\":\"" + user.getName() + "\",\"projectId\":\"" + projectId + "\"}";
+
+    Client client = Client.create();
+    client.setReadTimeout(1000);
+    client.setConnectTimeout(1000);
+    WebResource webResource = client.resource(sspUrl);
+    ClientResponse response = webResource.type("application/json")
+       .post(ClientResponse.class, input);
+
+    // SSP cannot decide if user and project are valid, so ignore.
+    if (response.getStatus() != 200)
+      throw new RuntimeException("CMRE SSP: Cannot resolve user '" + user.getName() + "' and project '" + projectId + "'");
+
+    String booleanString = response.getEntity(String.class);
+    // The booleanString should be either a 'true' or 'false' string
+    return Boolean.parseBoolean(booleanString);
   }
   
   private boolean isAdminByConfiguration(User user, Collection<String> groups) {
